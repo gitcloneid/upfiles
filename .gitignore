@@ -1,0 +1,18 @@
+# Storage folder (upload files)
+backend/storage/
+
+# Backend build artifacts
+backend/target/
+
+# Frontend
+frontend/.next/
+frontend/node_modules/
+
+# Environment files
+.env
+.env.local
+.env*.local
+
+# OS files
+.DS_Store
+Thumbs.db

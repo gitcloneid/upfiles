@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import type { TimerState } from '@/lib/types';
 
 interface TimerProps {
@@ -10,26 +10,46 @@ interface TimerProps {
 
 export function Timer({ timer, large = false }: TimerProps) {
   const [displaySeconds, setDisplaySeconds] = useState(timer.remaining_seconds);
+  const lastServerTime = useRef(timer.remaining_seconds);
+  const animationRef = useRef<number | null>(null);
 
   useEffect(() => {
+    // Selalu sync dengan server state
+    lastServerTime.current = timer.remaining_seconds;
+    
     if (!timer.is_running) {
       setDisplaySeconds(timer.remaining_seconds);
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+        animationRef.current = null;
+      }
       return;
     }
 
     const startedAt = timer.started_at ? new Date(timer.started_at).getTime() : Date.now();
     
+    // Gunakan requestAnimationFrame untuk update lebih smooth
     const updateTimer = () => {
-      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      const now = Date.now();
+      const elapsed = Math.floor((now - startedAt) / 1000);
       const remaining = Math.max(0, timer.duration_seconds - elapsed);
       setDisplaySeconds(remaining);
+      
+      if (remaining > 0) {
+        animationRef.current = requestAnimationFrame(updateTimer);
+      }
     };
 
+    // Update segera
     updateTimer();
-    const interval = setInterval(updateTimer, 1000);
 
-    return () => clearInterval(interval);
-  }, [timer]);
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+        animationRef.current = null;
+      }
+    };
+  }, [timer.is_running, timer.started_at, timer.duration_seconds, timer.remaining_seconds]);
 
   const hours = Math.floor(displaySeconds / 3600);
   const minutes = Math.floor((displaySeconds % 3600) / 60);
@@ -43,7 +63,7 @@ export function Timer({ timer, large = false }: TimerProps) {
 
   return (
     <div
-      className={`font-mono ${large ? 'text-6xl' : 'text-2xl'} font-bold ${
+      className={`font-mono ${large ? 'text-6xl' : 'text-2xl'} font-bold tabular-nums ${
         isZero ? 'text-red-600' : isLow ? 'text-orange-500 animate-pulse' : ''
       }`}
     >

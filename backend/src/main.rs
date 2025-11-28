@@ -11,14 +11,15 @@ use rand::Rng;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 const JWT_SECRET: &[u8] = b"lomba-coding-secret-key-2024";
 const MAX_FILE_SIZE: u64 = 300 * 1024 * 1024; // 300MB
+const TIMER_BROADCAST_INTERVAL_MS: u64 = 250; // Broadcast setiap 250ms untuk realtime
 
 // === Data Structures ===
 
@@ -202,14 +203,12 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
         [],
     )?;
 
-    // Insert default admin if not exists (username: admin, password: admin123)
     let default_hash = hash("admin123", DEFAULT_COST).unwrap();
     conn.execute(
         "INSERT OR IGNORE INTO admin (id, username, password_hash) VALUES (1, 'admin', ?1)",
         params![default_hash],
     )?;
 
-    // Insert default timer if not exists
     conn.execute(
         "INSERT OR IGNORE INTO timer (id, is_running, duration_seconds, remaining_seconds) VALUES (1, 0, 3600, 3600)",
         [],
@@ -221,7 +220,6 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
 fn load_state_from_db(conn: &Connection) -> AppState {
     let mut meja_list: HashMap<String, Meja> = HashMap::new();
 
-    // Load meja
     if let Ok(mut stmt) = conn.prepare("SELECT id, nomor, kode, nama_peserta FROM meja") {
         if let Ok(rows) = stmt.query_map([], |row| {
             Ok(Meja {
@@ -239,7 +237,6 @@ fn load_state_from_db(conn: &Connection) -> AppState {
         }
     }
 
-    // Load files for each meja
     if let Ok(mut stmt) = conn.prepare("SELECT id, meja_id, filename, size, uploaded_at, path FROM files ORDER BY uploaded_at DESC") {
         if let Ok(rows) = stmt.query_map([], |row| {
             let uploaded_at_str: String = row.get(4)?;
@@ -269,7 +266,6 @@ fn load_state_from_db(conn: &Connection) -> AppState {
         }
     }
 
-    // Load soal files
     let mut soal_files = vec![];
     if let Ok(mut stmt) = conn.prepare("SELECT id, filename, path, uploaded_at FROM soal") {
         if let Ok(rows) = stmt.query_map([], |row| {
@@ -288,7 +284,6 @@ fn load_state_from_db(conn: &Connection) -> AppState {
         }
     }
 
-    // Load timer
     let timer = if let Ok(mut stmt) = conn.prepare("SELECT is_running, duration_seconds, remaining_seconds, started_at FROM timer WHERE id = 1") {
         stmt.query_row([], |row| {
             let started_at_str: Option<String> = row.get(3)?;
@@ -363,6 +358,20 @@ fn get_soal_path() -> PathBuf {
 async fn broadcast_state(shared: &SharedState) {
     let state = shared.state.read().await;
     if let Ok(json) = serde_json::to_string(&*state) {
+        let _ = shared.broadcast_tx.send(json);
+    }
+}
+
+// Broadcast hanya timer state untuk performa lebih baik
+async fn broadcast_timer_only(shared: &SharedState) {
+    let state = shared.state.read().await;
+    let timer_msg = serde_json::json!({
+        "timer": state.timer,
+        "meja_list": state.meja_list,
+        "soal_files": state.soal_files,
+        "lomba_title": state.lomba_title
+    });
+    if let Ok(json) = serde_json::to_string(&timer_msg) {
         let _ = shared.broadcast_tx.send(json);
     }
 }
@@ -504,11 +513,9 @@ async fn generate_meja(
     let mut state = shared.state.write().await;
     let db = shared.db.lock().await;
 
-    // Clear existing meja from DB
     db.execute("DELETE FROM files", []).ok();
     db.execute("DELETE FROM meja", []).ok();
 
-    // Clear from state
     state.meja_list.clear();
 
     for i in 1..=body.jumlah {
@@ -684,18 +691,34 @@ async fn upload_soal(
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let filepath = get_soal_path().join(&filename);
-        let mut file = match std::fs::File::create(&filepath) {
-            Ok(f) => f,
+        
+        // Gunakan async file I/O dengan buffer besar
+        let mut file = match tokio::fs::File::create(&filepath).await {
+            Ok(f) => tokio::io::BufWriter::with_capacity(256 * 1024, f), // 256KB buffer
             Err(_) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": "Failed to create file"})),
         };
 
+        // Collect chunks ke buffer sebelum write
+        let mut buffer = Vec::with_capacity(1024 * 1024); // 1MB pre-allocated
         while let Some(chunk) = field.next().await {
             if let Ok(data) = chunk {
-                if file.write_all(&data).is_err() {
-                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": "Failed to write file"}));
+                buffer.extend_from_slice(&data);
+                // Flush ke disk setiap 4MB
+                if buffer.len() >= 4 * 1024 * 1024 {
+                    if file.write_all(&buffer).await.is_err() {
+                        return HttpResponse::InternalServerError().json(serde_json::json!({"error": "Failed to write file"}));
+                    }
+                    buffer.clear();
                 }
             }
         }
+        // Write remaining buffer
+        if !buffer.is_empty() {
+            if file.write_all(&buffer).await.is_err() {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": "Failed to write file"}));
+            }
+        }
+        file.flush().await.ok();
 
         let id = Uuid::new_v4().to_string();
         let uploaded_at = Utc::now();
@@ -737,7 +760,7 @@ async fn delete_soal(
 
     if let Some(idx) = state.soal_files.iter().position(|s| s.id == soal_id) {
         let soal = state.soal_files.remove(idx);
-        std::fs::remove_file(&soal.path).ok();
+        tokio::fs::remove_file(&soal.path).await.ok();
 
         let db = shared.db.lock().await;
         db.execute("DELETE FROM soal WHERE id = ?1", params![soal_id]).ok();
@@ -763,7 +786,6 @@ async fn export_meja(
     let mut meja_list: Vec<&Meja> = state.meja_list.values().collect();
     meja_list.sort_by_key(|m| m.nomor);
 
-    // Generate CSV
     let mut csv = String::from("Nomor Meja,Kode,Nama Peserta,Jumlah File,Status\n");
     for meja in &meja_list {
         let status = if meja.files.is_empty() { "Belum Upload" } else { "Sudah Upload" };
@@ -868,7 +890,6 @@ async fn upload_file(
             return HttpResponse::NotFound().json(serde_json::json!({"error": "Meja not found"}));
         }
 
-        // Check if timer has expired
         let remaining = if state.timer.is_running {
             if let Some(started) = state.timer.started_at {
                 let elapsed = Utc::now().signed_duration_since(started).num_seconds();
@@ -898,13 +919,17 @@ async fn upload_file(
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let filepath = upload_path.join(&filename);
-        let mut file = match std::fs::File::create(&filepath) {
-            Ok(f) => f,
+        
+        // Async file I/O dengan buffer besar untuk kecepatan maksimal
+        let mut file = match tokio::fs::File::create(&filepath).await {
+            Ok(f) => tokio::io::BufWriter::with_capacity(512 * 1024, f), // 512KB buffer
             Err(_) => continue,
         };
 
         let mut size: u64 = 0;
         let mut size_exceeded = false;
+        let mut buffer = Vec::with_capacity(2 * 1024 * 1024); // 2MB pre-allocated buffer
+
         while let Some(chunk) = field.next().await {
             if let Ok(data) = chunk {
                 size += data.len() as u64;
@@ -912,15 +937,26 @@ async fn upload_file(
                     size_exceeded = true;
                     break;
                 }
-                if file.write_all(&data).is_err() {
-                    break;
+                buffer.extend_from_slice(&data);
+                
+                // Flush ke disk setiap 4MB untuk balance memory dan I/O
+                if buffer.len() >= 4 * 1024 * 1024 {
+                    if file.write_all(&buffer).await.is_err() {
+                        break;
+                    }
+                    buffer.clear();
                 }
             }
         }
 
-        // If file size exceeded, delete the partial file and return error
+        // Write remaining buffer
+        if !buffer.is_empty() && !size_exceeded {
+            file.write_all(&buffer).await.ok();
+        }
+        file.flush().await.ok();
+
         if size_exceeded {
-            std::fs::remove_file(&filepath).ok();
+            tokio::fs::remove_file(&filepath).await.ok();
             return HttpResponse::PayloadTooLarge().json(serde_json::json!({
                 "error": "Ukuran file melebihi batas maksimal 300MB",
                 "max_size_mb": 300
@@ -988,7 +1024,7 @@ async fn download_soal(
     if let Some(soal) = state.soal_files.iter().find(|s| s.id == soal_id) {
         let filepath = PathBuf::from(&soal.path);
         if filepath.exists() {
-            if let Ok(file_data) = std::fs::read(&filepath) {
+            if let Ok(file_data) = tokio::fs::read(&filepath).await {
                 let mime = mime_guess::from_path(&filepath).first_or_octet_stream();
                 return HttpResponse::Ok()
                     .content_type(mime.to_string())
@@ -1009,8 +1045,8 @@ async fn preview_archive(path: web::Path<(String, String)>) -> impl Responder {
 
     let entries: Vec<ArchiveEntry> = vec![];
 
-    if let Ok(dir) = std::fs::read_dir(&upload_path) {
-        for entry in dir.flatten() {
+    if let Ok(mut dir) = tokio::fs::read_dir(&upload_path).await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
             let filepath = entry.path();
             let filename = filepath.file_name().unwrap_or_default().to_string_lossy();
 
@@ -1081,7 +1117,7 @@ async fn preview_file_content(query: web::Query<HashMap<String, String>>) -> imp
     }
 
     let filename = filepath.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let metadata = std::fs::metadata(&filepath).ok();
+    let metadata = tokio::fs::metadata(&filepath).await.ok();
     let size = metadata.map(|m| m.len()).unwrap_or(0);
 
     let text_extensions = ["txt", "html", "css", "js", "ts", "tsx", "jsx", "json", "xml", "md", "py", "rs", "c", "cpp", "h", "java", "php", "sql", "sh", "bat", "yml", "yaml", "toml", "ini", "cfg", "log"];
@@ -1089,7 +1125,7 @@ async fn preview_file_content(query: web::Query<HashMap<String, String>>) -> imp
     let is_text = text_extensions.contains(&ext.as_str());
 
     let content = if is_text && size < 1_000_000 {
-        std::fs::read_to_string(&filepath).ok()
+        tokio::fs::read_to_string(&filepath).await.ok()
     } else {
         None
     };
@@ -1113,6 +1149,7 @@ async fn ws_handler(
 
     let mut rx = shared.broadcast_tx.subscribe();
 
+    // Kirim state awal ke client baru
     {
         let state = shared.state.read().await;
         if let Ok(json) = serde_json::to_string(&*state) {
@@ -1120,8 +1157,7 @@ async fn ws_handler(
         }
     }
 
-    let _shared_clone = shared.clone();
-
+    // Hanya handle WebSocket messages, TIDAK spawn timer task baru
     actix_web::rt::spawn(async move {
         loop {
             tokio::select! {
@@ -1150,55 +1186,73 @@ async fn ws_handler(
         }
     });
 
-    // Timer tick task
-    let shared_timer = shared.clone();
-    actix_web::rt::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            let mut state = shared_timer.state.write().await;
+    Ok(res)
+}
+
+// === Global Timer Task - Hanya berjalan SEKALI ===
+async fn start_global_timer_task(shared: Arc<SharedState>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(TIMER_BROADCAST_INTERVAL_MS));
+    let mut last_remaining: i64 = -1;
+    
+    loop {
+        interval.tick().await;
+        
+        let should_broadcast = {
+            let mut state = shared.state.write().await;
             if state.timer.is_running {
                 if let Some(started) = state.timer.started_at {
                     let elapsed = Utc::now().signed_duration_since(started).num_seconds();
-                    let remaining = state.timer.duration_seconds - elapsed;
-                    if remaining <= 0 {
-                        state.timer.remaining_seconds = 0;
-                        state.timer.is_running = false;
-                        state.timer.started_at = None;
-                    } else {
+                    let remaining = (state.timer.duration_seconds - elapsed).max(0);
+                    
+                    // Hanya update jika nilai berubah
+                    if remaining != last_remaining {
+                        last_remaining = remaining;
                         state.timer.remaining_seconds = remaining;
+                        
+                        if remaining <= 0 {
+                            state.timer.is_running = false;
+                            state.timer.started_at = None;
+                        }
+                        true
+                    } else {
+                        false
                     }
-                    drop(state);
-                    broadcast_state(&shared_timer).await;
+                } else {
+                    false
                 }
+            } else {
+                last_remaining = state.timer.remaining_seconds;
+                false
             }
+        };
+        
+        if should_broadcast {
+            broadcast_timer_only(&shared).await;
         }
-    });
-
-    Ok(res)
+    }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     println!("===========================================");
-    println!("  Lomba Coding Server");
+    println!("  Lomba Coding Server - OPTIMIZED");
     println!("===========================================");
     println!("Server: http://localhost:3001");
-    println!("Default admin: admin123 / admin123");
+    println!("Default admin: admin / admin123");
+    println!("Timer broadcast: {}ms interval", TIMER_BROADCAST_INTERVAL_MS);
     println!("===========================================");
 
     get_storage_path();
     get_soal_path();
 
-    // Initialize database
     let db_path = get_storage_path().join("lomba.db");
     let conn = Connection::open(&db_path).expect("Failed to open database");
     init_database(&conn).expect("Failed to initialize database");
 
-    // Load state from database
     let initial_state = load_state_from_db(&conn);
 
-    let (broadcast_tx, _) = broadcast::channel::<String>(100);
+    // Buffer lebih besar untuk broadcast channel
+    let (broadcast_tx, _) = broadcast::channel::<String>(256);
 
     let shared_state = Arc::new(SharedState {
         state: RwLock::new(initial_state),
@@ -1206,25 +1260,36 @@ async fn main() -> std::io::Result<()> {
         db: Mutex::new(conn),
     });
 
+    // Start SINGLE global timer task
+    let timer_shared = shared_state.clone();
+    tokio::spawn(async move {
+        start_global_timer_task(timer_shared).await;
+    });
+
+    let server_shared = shared_state.clone();
+
     HttpServer::new(move || {
         let cors = Cors::default()
             .allow_any_origin()
             .allow_any_method()
             .allow_any_header();
 
-        // Set max payload size to 300MB
         let payload_config = web::PayloadConfig::default()
-            .limit(300 * 1024 * 1024); // 300MB
+            .limit(300 * 1024 * 1024);
+
+        // Multipart config untuk upload lebih cepat
+        let multipart_config = actix_multipart::form::MultipartFormConfig::default()
+            .total_limit(300 * 1024 * 1024)
+            .memory_limit(50 * 1024 * 1024); // 50MB memory buffer
 
         App::new()
             .wrap(cors)
             .app_data(payload_config)
-            .app_data(web::Data::new(shared_state.clone()))
-            // Auth routes
+            .app_data(multipart_config)
+            .app_data(web::Data::new(server_shared.clone()))
             .route("/api/auth/login", web::post().to(admin_login))
             .route("/api/auth/verify", web::get().to(verify_token))
             .route("/api/auth/change-password", web::post().to(change_password))
-            // Admin routes
             .route("/api/state", web::get().to(get_state))
             .route("/api/admin/meja/generate", web::post().to(generate_meja))
             .route("/api/admin/meja/export", web::get().to(export_meja))
@@ -1236,22 +1301,19 @@ async fn main() -> std::io::Result<()> {
             .route("/api/admin/timer/adjust", web::post().to(adjust_timer))
             .route("/api/admin/soal/upload", web::post().to(upload_soal))
             .route("/api/admin/soal/{id}", web::delete().to(delete_soal))
-            // Participant routes
             .route("/api/login", web::post().to(login_peserta))
             .route("/api/meja/{id}", web::get().to(get_meja))
             .route("/api/meja/{id}/update", web::post().to(update_peserta))
             .route("/api/meja/{id}/upload", web::post().to(upload_file))
             .route("/api/soal", web::get().to(get_soal_list))
             .route("/api/soal/{id}/download", web::get().to(download_soal))
-            // Archive preview
             .route("/api/archive/preview/{meja_id}/{file_id}", web::get().to(preview_archive))
             .route("/api/archive/preview", web::get().to(preview_archive_by_path))
             .route("/api/file/preview", web::get().to(preview_file_content))
-            // WebSocket
             .route("/ws", web::get().to(ws_handler))
-            // Static files
             .service(Files::new("/storage", "./storage"))
     })
+    .workers(4) // Optimal untuk konkurensi
     .bind("0.0.0.0:3001")?
     .run()
     .await
