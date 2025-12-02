@@ -32,6 +32,7 @@ export default function AdminPage() {
   const [jumlahMeja, setJumlahMeja] = useState(10);
   const [timerMinutes, setTimerMinutes] = useState(60);
   const soalInputRef = useRef<HTMLInputElement>(null);
+  const [hasSoalFiles, setHasSoalFiles] = useState(false);
 
   const [archiveView, setArchiveView] = useState<{
     path: string;
@@ -77,20 +78,75 @@ export default function AdminPage() {
     setIsAuthenticated(false);
   };
 
-  const handleExportCsv = async () => {
-    try {
-      const res = await api.exportMejaCsv();
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "daftar_meja.csv";
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
-    } catch (e) {
-      console.error("Export failed:", e);
+  const handleExportPdf = () => {
+    const mejaData = Object.values(state?.meja_list || {}).sort(
+      (a, b) => a.nomor - b.nomor
+    );
+    
+    const rows = [];
+    for (let i = 0; i < mejaData.length; i += 3) {
+      rows.push(mejaData.slice(i, i + 3));
+    }
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Daftar Meja</title>
+        <style>
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body { font-family: Arial, sans-serif; padding: 20px; }
+          h1 { text-align: center; margin-bottom: 20px; font-size: 24px; }
+          .row { display: flex; gap: 15px; margin-bottom: 15px; }
+          .card { 
+            flex: 1; 
+            border: 2px solid #333; 
+            border-radius: 8px; 
+            padding: 20px; 
+            text-align: center;
+            min-width: 0;
+          }
+          .meja-name { font-size: 18px; font-weight: bold; margin-bottom: 10px; }
+          .meja-kode { 
+            font-size: 28px; 
+            font-family: monospace; 
+            font-weight: bold; 
+            background: #f0f0f0; 
+            padding: 10px; 
+            border-radius: 4px;
+            letter-spacing: 3px;
+          }
+          .empty { visibility: hidden; }
+          @media print {
+            body { padding: 10px; }
+            .row { page-break-inside: avoid; }
+          }
+        </style>
+      </head>
+      <body>
+        <h1>Daftar Kode Meja</h1>
+        ${rows.map(row => `
+          <div class="row">
+            ${row.map(meja => `
+              <div class="card">
+                <div class="meja-name">Meja ${meja.nomor}</div>
+                <div class="meja-kode">${meja.kode.toUpperCase()}</div>
+              </div>
+            `).join('')}
+            ${row.length < 3 ? Array(3 - row.length).fill('<div class="card empty"></div>').join('') : ''}
+          </div>
+        `).join('')}
+      </body>
+      </html>
+    `;
+
+    const printWindow = window.open('', '_blank');
+    if (printWindow) {
+      printWindow.document.write(html);
+      printWindow.document.close();
+      printWindow.onload = () => {
+        printWindow.print();
+      };
     }
   };
 
@@ -143,6 +199,7 @@ export default function AdminPage() {
       } finally {
         setTimeout(() => setUploadProgress(null), 1000);
         if (soalInputRef.current) soalInputRef.current.value = "";
+        setHasSoalFiles(false);
       }
     }
   };
@@ -223,7 +280,7 @@ export default function AdminPage() {
                 <Separator />
                 <div>
                   <Label className="text-muted-foreground text-sm">
-                    Tambah/Kurangi Waktu (Realtime)
+                    Waktu
                   </Label>
                   <div className="flex justify-center gap-2 mt-2">
                     <Button
@@ -344,8 +401,8 @@ export default function AdminPage() {
                 </div>
                 <Button onClick={handleGenerateMeja}>Generate</Button>
                 {mejaList.length > 0 && (
-                  <Button variant="outline" onClick={handleExportCsv}>
-                    Export CSV
+                  <Button variant="outline" onClick={handleExportPdf}>
+                    Export PDF
                   </Button>
                 )}
               </div>
@@ -414,8 +471,8 @@ export default function AdminPage() {
             <CardHeader className="flex flex-row items-center justify-between">
               <CardTitle>Daftar Meja ({mejaList.length})</CardTitle>
               {mejaList.length > 0 && (
-                <Button variant="outline" size="sm" onClick={handleExportCsv}>
-                  Export CSV
+                <Button variant="outline" size="sm" onClick={handleExportPdf}>
+                  Export PDF
                 </Button>
               )}
             </CardHeader>
@@ -532,19 +589,21 @@ export default function AdminPage() {
               <CardTitle>File Soal</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="flex items-end gap-4">
-                <div className="flex-1">
+              <div className="space-y-3">
+                <div>
                   <Label>Upload File Soal</Label>
                   <Input
                     type="file"
                     ref={soalInputRef}
                     multiple
                     disabled={uploadProgress !== null}
+                    onChange={(e) => setHasSoalFiles((e.target.files?.length ?? 0) > 0)}
                   />
                 </div>
                 <Button
                   onClick={handleUploadSoal}
-                  disabled={uploadProgress !== null}
+                  disabled={uploadProgress !== null || !hasSoalFiles}
+                  className="w-full"
                 >
                   {uploadProgress !== null ? "Uploading..." : "Upload"}
                 </Button>

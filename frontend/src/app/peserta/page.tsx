@@ -29,6 +29,7 @@ export default function PesertaPage() {
   const [nama, setNama] = useState("");
   const [error, setError] = useState("");
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [hasFiles, setHasFiles] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Timer alert hook (always enabled when logged in)
@@ -136,6 +137,7 @@ export default function PesertaPage() {
     } finally {
       setTimeout(() => setUploadProgress(null), 1000);
       if (fileInputRef.current) fileInputRef.current.value = "";
+      setHasFiles(false);
     }
   };
 
@@ -251,16 +253,14 @@ export default function PesertaPage() {
               </div>
             </div>
             <Separator />
-            <div className="flex items-end gap-4">
-              <div className="flex-1">
-                <Label>Nama Peserta</Label>
-                <Input
-                  value={nama}
-                  onChange={(e) => setNama(e.target.value)}
-                  placeholder="Masukkan nama anda"
-                />
-              </div>
-              <Button onClick={handleUpdateNama}>Simpan</Button>
+            <div>
+              <Label>Nama Peserta</Label>
+              <Input
+                value={nama}
+                onChange={(e) => setNama(e.target.value)}
+                onBlur={handleUpdateNama}
+                placeholder="Masukkan nama anda"
+              />
             </div>
           </CardContent>
         </Card>
@@ -294,7 +294,7 @@ export default function PesertaPage() {
           <CardHeader>
             <CardTitle>Upload Hasil Kerja</CardTitle>
             <CardDescription>
-              Upload file hasil kerja anda (ZIP,RAR).
+              Upload file hasil kerja anda (ZIP).
                Maksimal 300MB per file.
             </CardDescription>
           </CardHeader>
@@ -313,8 +313,8 @@ export default function PesertaPage() {
               </Alert>
             )}
 
-            <div className="flex items-end gap-4">
-              <div className="flex-1">
+            <div className="space-y-3">
+              <div>
                 <Label>Pilih File</Label>
                 <Input
                   type="file"
@@ -322,11 +322,13 @@ export default function PesertaPage() {
                   multiple
                   accept=".zip,.rar,*"
                   disabled={uploadProgress !== null || isTimeExpired}
+                  onChange={(e) => setHasFiles((e.target.files?.length ?? 0) > 0)}
                 />
               </div>
               <Button
                 onClick={handleUpload}
-                disabled={uploadProgress !== null || isTimeExpired}
+                disabled={uploadProgress !== null || isTimeExpired || !hasFiles}
+                className="w-full"
               >
                 {uploadProgress !== null ? "Uploading..." : "Upload"}
               </Button>
